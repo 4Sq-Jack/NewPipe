@@ -9,8 +9,10 @@ import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
+import android.system.ErrnoException;
 import android.system.Os;
 import android.system.StructStatVfs;
 import android.util.Log;
@@ -22,7 +24,7 @@ import androidx.documentfile.provider.DocumentFile;
 import org.schabi.newpipe.settings.NewPipeSettings;
 import org.schabi.newpipe.util.FilePickerActivityHelper;
 
-import java.io.FileDescriptor;
+import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Files;
@@ -36,6 +38,9 @@ import java.util.stream.Stream;
 
 public class StoredDirectoryHelper {
     private static final String TAG = StoredDirectoryHelper.class.getSimpleName();
+    private static final String EXTERNAL_STORAGE_AUTHORITY =
+            "com.android.externalstorage.documents";
+    private static final String PRIMARY_VOLUME_ID = "primary";
     public static final int PERMISSION_FLAGS = Intent.FLAG_GRANT_READ_URI_PERMISSION
             | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
 
@@ -195,15 +200,21 @@ public class StoredDirectoryHelper {
                 stat = Os.statvfs(ioTree.toString());
 
             } else {
-                // SAF file, we can't get a path directly, so obtain a file descriptor first
-                // and then use fstatvfs with the file descriptor
-                try (ParcelFileDescriptor parcelFileDescriptor =
-                             context.getContentResolver().openFileDescriptor(getUri(), "r")) {
-                    if (parcelFileDescriptor == null) {
-                        return Long.MAX_VALUE;
+                // SAF folder on internal storage or SD card: statvfs the volume directly, since
+                // opening the folder through the storage provider (below) can take many seconds
+                final StructStatVfs volumeStat = statExternalStorageVolume(getUri());
+                if (volumeStat != null) {
+                    stat = volumeStat;
+                } else {
+                    // other SAF providers: we can't get a path directly, so obtain a file
+                    // descriptor first and then use fstatvfs with the file descriptor
+                    try (ParcelFileDescriptor parcelFileDescriptor = context.getContentResolver()
+                            .openFileDescriptor(getUri(), "r")) {
+                        if (parcelFileDescriptor == null) {
+                            return Long.MAX_VALUE;
+                        }
+                        stat = Os.fstatvfs(parcelFileDescriptor.getFileDescriptor());
                     }
-                    final FileDescriptor fileDescriptor = parcelFileDescriptor.getFileDescriptor();
-                    stat = Os.fstatvfs(fileDescriptor);
                 }
             }
 
@@ -213,6 +224,39 @@ public class StoredDirectoryHelper {
             // ignore any error
             Log.e(TAG, "Could not get free storage space", e);
             return Long.MAX_VALUE;
+        }
+    }
+
+    /**
+     * Gets the file system stats of the storage volume containing a SAF folder, without querying
+     * the storage provider. Only works for folders on internal storage or SD cards, i.e. those
+     * provided by Android's ExternalStorageProvider, whose document ids look like
+     * {@code primary:Movies} or {@code 1234-ABCD:Movies}.
+     *
+     * @param treeUri the SAF tree URI of the folder
+     * @return the volume stats, or {@code null} if the volume can't be determined or accessed
+     */
+    @Nullable
+    private static StructStatVfs statExternalStorageVolume(@NonNull final Uri treeUri) {
+        if (!EXTERNAL_STORAGE_AUTHORITY.equals(treeUri.getAuthority())) {
+            return null;
+        }
+
+        final String volumeId;
+        try {
+            volumeId = DocumentsContract.getTreeDocumentId(treeUri).split(":", 2)[0];
+        } catch (final IllegalArgumentException e) {
+            return null; // not a tree URI
+        }
+
+        final File root = PRIMARY_VOLUME_ID.equalsIgnoreCase(volumeId)
+                ? Environment.getExternalStorageDirectory()
+                : new File("/storage", volumeId);
+        try {
+            return Os.statvfs(root.getAbsolutePath());
+        } catch (final ErrnoException e) {
+            Log.w(TAG, "Could not statvfs " + root + ", falling back to SAF", e);
+            return null;
         }
     }
 
