@@ -59,6 +59,7 @@ public class MissionsFragment extends Fragment {
 
     private RecyclerView mList;
     private View mEmpty;
+    private View mLoading;
     private MissionAdapter mAdapter;
     private GridLayoutManager mGridManager;
     private LinearLayoutManager mLinearManager;
@@ -95,6 +96,8 @@ public class MissionsFragment extends Fragment {
             return; // the fragment has been destroyed in the meantime
         }
 
+        mLoading.setVisibility(View.GONE);
+
         mAdapter = new MissionAdapter(mContext, mBinder.getDownloadManager(), mEmpty, getView());
 
         mAdapter.setRecover(MissionsFragment.this::recoverMission);
@@ -118,6 +121,7 @@ public class MissionsFragment extends Fragment {
 
         // Views
         mEmpty = v.findViewById(R.id.list_empty_view);
+        mLoading = v.findViewById(R.id.loading_progress_bar);
         mList = v.findViewById(R.id.mission_recycler);
 
         // Init layouts managers
