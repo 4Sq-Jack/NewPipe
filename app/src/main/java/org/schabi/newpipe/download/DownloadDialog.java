@@ -231,15 +231,23 @@ public class DownloadDialog extends DialogFragment
             @Override
             public void onServiceConnected(final ComponentName cname, final IBinder service) {
                 final DownloadManagerBinder mgr = (DownloadManagerBinder) service;
+                final ServiceConnection connection = this;
 
-                mainStorageAudio = mgr.getMainStorageAudio();
-                mainStorageVideo = mgr.getMainStorageVideo();
-                downloadManager = mgr.getDownloadManager();
-                askForSavePath = mgr.askForSavePath();
+                // the download history may still be loading in the background
+                mgr.whenReady(() -> {
+                    mainStorageAudio = mgr.getMainStorageAudio();
+                    mainStorageVideo = mgr.getMainStorageVideo();
+                    downloadManager = mgr.getDownloadManager();
+                    askForSavePath = mgr.askForSavePath();
 
-                okButton.setEnabled(true);
+                    setOkButtonEnabled(true);
 
-                context.unbindService(this);
+                    try {
+                        context.unbindService(connection);
+                    } catch (final IllegalArgumentException e) {
+                        // the activity was destroyed meanwhile, which already unbound the service
+                    }
+                });
             }
 
             @Override
@@ -350,7 +358,8 @@ public class DownloadDialog extends DialogFragment
         toolbar.setNavigationContentDescription(R.string.cancel);
 
         okButton = toolbar.getMenu().findItem(R.id.okay);
-        okButton.setEnabled(false); // disable until the download service connection is done
+        // disable until the download service connection is done
+        okButton.setEnabled(downloadManager != null);
 
         toolbar.setOnMenuItemClickListener(item -> {
             if (item.getItemId() == R.id.okay) {

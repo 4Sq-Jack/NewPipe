@@ -49,7 +49,9 @@ import org.schabi.newpipe.util.Localization;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.Objects;
 
 import us.shandian.giga.get.DownloadMission;
@@ -86,7 +88,13 @@ public class DownloadManagerService extends Service {
     private static final String ACTION_OPEN_DOWNLOADS_FINISHED = APPLICATION_ID + ".open_downloads_finished";
 
     private DownloadManagerBinder mBinder;
+    /**
+     * {@code null} until the download history has been loaded on a background thread, see
+     * {@link #whenManagerReady(Runnable)}.
+     */
     private DownloadManager mManager;
+    private final List<Runnable> mManagerReadyCallbacks = new ArrayList<>();
+    private final Set<String> mPendingPreferenceChanges = new LinkedHashSet<>();
     private Notification mNotification;
     private Handler mHandler;
     private boolean mForeground = false;
@@ -141,7 +149,7 @@ public class DownloadManagerService extends Service {
 
         mPrefs = PreferenceManager.getDefaultSharedPreferences(this);
 
-        mManager = new DownloadManager(this, mHandler, loadMainVideoStorage(), loadMainAudioStorage());
+        loadDownloadManager(loadMainVideoStorage(), loadMainAudioStorage());
 
         Intent openDownloadListIntent = new Intent(this, DownloadActivity.class)
                 .setAction(Intent.ACTION_MAIN);
@@ -181,11 +189,59 @@ public class DownloadManagerService extends Service {
 
         mPrefs.registerOnSharedPreferenceChangeListener(mPrefChangeListener);
 
-        handlePreferenceChange(mPrefs, getString(R.string.downloads_cross_network));
-        handlePreferenceChange(mPrefs, getString(R.string.downloads_maximum_retry));
-        handlePreferenceChange(mPrefs, getString(R.string.downloads_queue_limit));
+        // applied to the DownloadManager as soon as it is loaded
+        mPendingPreferenceChanges.add(getString(R.string.downloads_cross_network));
+        mPendingPreferenceChanges.add(getString(R.string.downloads_maximum_retry));
+        mPendingPreferenceChanges.add(getString(R.string.downloads_queue_limit));
 
         mLock = new LockManager(this);
+    }
+
+    /**
+     * Loads the download history on a background thread. This queries the storage of every
+     * download (and checks whether its file still exists), which takes very long with many
+     * downloads. Doing it on the main thread froze the app and triggered ANRs whenever the
+     * service was started, e.g. when opening the download dialog or the downloads list.
+     */
+    private void loadDownloadManager(StoredDirectoryHelper storageVideo, StoredDirectoryHelper storageAudio) {
+        final Handler handler = mHandler;
+        new Thread(() -> {
+            final DownloadManager manager = new DownloadManager(this, handler, storageVideo, storageAudio);
+            handler.post(() -> onManagerLoaded(manager));
+        }, "DownloadManagerLoader").start();
+    }
+
+    private void onManagerLoaded(@NonNull DownloadManager manager) {
+        if (mHandler == null) {
+            return; // the service has been destroyed in the meantime
+        }
+
+        mManager = manager;
+
+        for (String key : mPendingPreferenceChanges) {
+            handlePreferenceChange(mPrefs, key);
+        }
+        mPendingPreferenceChanges.clear();
+
+        // network changes received while loading were ignored, see handleConnectivityState()
+        handleConnectivityState(false);
+
+        for (Runnable callback : mManagerReadyCallbacks) {
+            callback.run();
+        }
+        mManagerReadyCallbacks.clear();
+    }
+
+    /**
+     * Runs {@code callback} on the main thread once the {@link DownloadManager} is loaded, or
+     * immediately if it is already loaded.
+     */
+    private void whenManagerReady(@NonNull Runnable callback) {
+        if (mManager != null) {
+            callback.run();
+        } else {
+            mManagerReadyCallbacks.add(callback);
+        }
     }
 
     @Override
@@ -200,7 +256,7 @@ public class DownloadManagerService extends Service {
         String action = intent.getAction();
         if (action != null) {
             if (action.equals(Intent.ACTION_RUN)) {
-                mHandler.post(() -> startMission(intent));
+                mHandler.post(() -> whenManagerReady(() -> startMission(intent)));
             } else if (downloadDoneNotification != null) {
                 if (action.equals(ACTION_RESET_DOWNLOAD_FINISHED) || action.equals(ACTION_OPEN_DOWNLOADS_FINISHED)) {
                     downloadDoneCount = 0;
@@ -245,7 +301,8 @@ public class DownloadManagerService extends Service {
         if (icLauncher != null) icLauncher.recycle();
 
         mHandler = null;
-        mManager.pauseAllMissions(true);
+        mManagerReadyCallbacks.clear();
+        if (mManager != null) mManager.pauseAllMissions(true);
     }
 
     @Override
@@ -312,6 +369,11 @@ public class DownloadManagerService extends Service {
     }
 
     private void handlePreferenceChange(SharedPreferences prefs, @NonNull String key) {
+        if (mManager == null) {
+            mPendingPreferenceChanges.add(key); // applied once the manager is loaded
+            return;
+        }
+
         if (getString(R.string.downloads_maximum_retry).equals(key)) {
             try {
                 String value = prefs.getString(key, getString(R.string.downloads_maximum_retry_default));
@@ -535,18 +597,31 @@ public class DownloadManagerService extends Service {
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
     public class DownloadManagerBinder extends Binder {
+        /**
+         * Runs {@code callback} on the main thread once the download history is loaded (or
+         * immediately if it already is). Only after that the other methods of this binder may
+         * be used.
+         */
+        public void whenReady(@NonNull Runnable callback) {
+            whenManagerReady(callback);
+        }
+
+        /**
+         * @return the download manager, or {@code null} if it is still loading, see
+         * {@link #whenReady(Runnable)}
+         */
         public DownloadManager getDownloadManager() {
             return mManager;
         }
 
         @Nullable
         public StoredDirectoryHelper getMainStorageVideo() {
-            return mManager.mMainStorageVideo;
+            return mManager == null ? null : mManager.mMainStorageVideo;
         }
 
         @Nullable
         public StoredDirectoryHelper getMainStorageAudio() {
-            return mManager.mMainStorageAudio;
+            return mManager == null ? null : mManager.mMainStorageAudio;
         }
 
         public boolean askForSavePath() {

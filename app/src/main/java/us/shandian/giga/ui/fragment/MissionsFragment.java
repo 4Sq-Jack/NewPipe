@@ -76,17 +76,10 @@ public class MissionsFragment extends Fragment {
         public void onServiceConnected(ComponentName name, IBinder binder) {
             mBinder = (DownloadManagerBinder) binder;
             mBinder.clearDownloadNotifications();
-
-            mAdapter = new MissionAdapter(mContext, mBinder.getDownloadManager(), mEmpty, getView());
-
-            mAdapter.setRecover(MissionsFragment.this::recoverMission);
-
-            setAdapterButtons();
-
-            mBinder.addMissionEventListener(mAdapter);
             mBinder.enableNotifications(false);
 
-            updateList();
+            // the download history may still be loading in the background
+            mBinder.whenReady(MissionsFragment.this::onDownloadManagerReady);
         }
 
         @Override
@@ -96,6 +89,22 @@ public class MissionsFragment extends Fragment {
 
 
     };
+
+    private void onDownloadManagerReady() {
+        if (mBinder == null || getView() == null) {
+            return; // the fragment has been destroyed in the meantime
+        }
+
+        mAdapter = new MissionAdapter(mContext, mBinder.getDownloadManager(), mEmpty, getView());
+
+        mAdapter.setRecover(MissionsFragment.this::recoverMission);
+
+        setAdapterButtons();
+
+        mBinder.addMissionEventListener(mAdapter);
+
+        updateList();
+    }
 
     @Override
     public View onCreateView(@NonNull LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
@@ -161,12 +170,14 @@ public class MissionsFragment extends Fragment {
     @Override
     public void onDestroy() {
         super.onDestroy();
-        if (mBinder == null || mAdapter == null) return;
+        if (mBinder == null) return;
 
-        mBinder.removeMissionEventListener(mAdapter);
+        if (mAdapter != null) {
+            mBinder.removeMissionEventListener(mAdapter);
+            mAdapter.onDestroy();
+        }
         mBinder.enableNotifications(true);
         mContext.unbindService(mConnection);
-        mAdapter.onDestroy();
 
         mBinder = null;
         mAdapter = null;
@@ -186,6 +197,10 @@ public class MissionsFragment extends Fragment {
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
+        if (mAdapter == null) {
+            return super.onOptionsItemSelected(item); // the download history is still loading
+        }
+
         int itemId = item.getItemId();
         if (itemId == R.id.switch_mode) {
             mLinear = !mLinear;
