@@ -79,8 +79,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.Callable;
 
+import io.reactivex.rxjava3.android.schedulers.AndroidSchedulers;
+import io.reactivex.rxjava3.core.Single;
 import io.reactivex.rxjava3.disposables.CompositeDisposable;
+import io.reactivex.rxjava3.functions.Consumer;
+import io.reactivex.rxjava3.schedulers.Schedulers;
 import us.shandian.giga.get.MissionRecoveryInfo;
 import us.shandian.giga.postprocessing.Postprocessing;
 import us.shandian.giga.service.DownloadManager;
@@ -502,16 +507,17 @@ public class DownloadDialog extends DialogFragment
             return;
         }
 
-        final DocumentFile docFile = DocumentFile.fromSingleUri(context,
-                result.getData().getData());
+        final Uri fileUri = result.getData().getData();
+        final DocumentFile docFile = DocumentFile.fromSingleUri(context, fileUri);
         if (docFile == null) {
             showFailedDialog(R.string.general_error);
             return;
         }
 
         // check if the selected file was previously used
-        checkSelectedDownload(null, result.getData().getData(), docFile.getName(),
-                docFile.getType());
+        runStorageTask(() -> new String[]{docFile.getName(), docFile.getType()},
+                nameAndType -> checkSelectedDownload(null, fileUri, nameAndType[0],
+                        nameAndType[1]));
     }
 
     private void requestDownloadPickFolderResult(@NonNull final ActivityResult result,
@@ -537,13 +543,26 @@ public class DownloadDialog extends DialogFragment
         PreferenceManager.getDefaultSharedPreferences(context).edit().putString(key,
                 uri.toString()).apply();
 
-        try {
-            final StoredDirectoryHelper mainStorage = new StoredDirectoryHelper(context, uri, tag);
-            checkSelectedDownload(mainStorage, mainStorage.findFile(filenameTmp),
-                    filenameTmp, mimeTmp);
-        } catch (final IOException e) {
-            showFailedDialog(R.string.general_error);
-        }
+        final Uri folderUri = uri;
+        final String filename = filenameTmp;
+        final String mime = mimeTmp;
+        runStorageTask(() -> {
+            try {
+                final StoredDirectoryHelper mainStorage =
+                        new StoredDirectoryHelper(context, folderUri, tag);
+                return Optional.of(new ExistingFileCheck(mainStorage,
+                        mainStorage.findFile(filename)));
+            } catch (final IOException e) {
+                return Optional.<ExistingFileCheck>empty();
+            }
+        }, check -> {
+            if (check.isPresent()) {
+                checkSelectedDownload(check.get().storage, check.get().existingFile,
+                        filename, mime);
+            } else {
+                showFailedDialog(R.string.general_error);
+            }
+        });
     }
 
     /*//////////////////////////////////////////////////////////////////////////
@@ -801,22 +820,13 @@ public class DownloadDialog extends DialogFragment
         }
 
         if (!askForSavePath && (mainStorage == null
-                || mainStorage.isDirect() == NewPipeSettings.useStorageAccessFramework(context)
-                || mainStorage.isInvalidSafStorage())) {
+                || mainStorage.isDirect() == NewPipeSettings.useStorageAccessFramework(context))) {
             // Pick new download folder if one of:
             // - Download folder is not set
             // - Download folder uses SAF while SAF is disabled
             // - Download folder doesn't use SAF while SAF is enabled
-            // - Download folder uses SAF but the user manually revoked access to it
-            Toast.makeText(context, getString(R.string.no_dir_yet),
-                    Toast.LENGTH_LONG).show();
-
-            if (dialogBinding.videoAudioGroup.getCheckedRadioButtonId() == R.id.audio_button) {
-                launchDirectoryPicker(requestDownloadPickAudioFolderLauncher);
-            } else {
-                launchDirectoryPicker(requestDownloadPickVideoFolderLauncher);
-            }
-
+            // (revoked SAF access is checked below, as that requires querying the storage)
+            askForNewDownloadFolder();
             return;
         }
 
@@ -841,57 +851,129 @@ public class DownloadDialog extends DialogFragment
             return;
         }
 
-        // Check for free storage space
-        final long freeSpace = mainStorage.getFreeStorageSpace();
-        if (freeSpace <= size) {
-            Toast.makeText(context, getString(R.
-                    string.error_insufficient_storage), Toast.LENGTH_LONG).show();
-            // move the user to storage setting tab
-            final Intent storageSettingsIntent = new Intent(Settings.
-                    ACTION_INTERNAL_STORAGE_SETTINGS);
-            if (storageSettingsIntent.resolveActivity(context.getPackageManager())
-                    != null) {
-                startActivity(storageSettingsIntent);
+        final String filename = filenameTmp;
+        final String mime = mimeTmp;
+        runStorageTask(() -> {
+            if (mainStorage.isInvalidSafStorage()) {
+                return PreparedStorage.INVALID;
+            } else if (mainStorage.getFreeStorageSpace() <= size) {
+                return PreparedStorage.INSUFFICIENT_SPACE;
             }
-            return;
-        }
+            // check for existing file with the same name
+            return new PreparedStorage(mainStorage.findFile(filename));
+        }, prepared -> {
+            if (prepared == PreparedStorage.INVALID) {
+                // the download folder uses SAF but the user manually revoked access to it
+                askForNewDownloadFolder();
+                return;
+            } else if (prepared == PreparedStorage.INSUFFICIENT_SPACE) {
+                Toast.makeText(context, getString(R.
+                        string.error_insufficient_storage), Toast.LENGTH_LONG).show();
+                // move the user to storage setting tab
+                final Intent storageSettingsIntent = new Intent(Settings.
+                        ACTION_INTERNAL_STORAGE_SETTINGS);
+                if (storageSettingsIntent.resolveActivity(context.getPackageManager())
+                        != null) {
+                    startActivity(storageSettingsIntent);
+                }
+                return;
+            }
 
-        // check for existing file with the same name
-        checkSelectedDownload(mainStorage, mainStorage.findFile(filenameTmp), filenameTmp,
-                mimeTmp);
+            checkSelectedDownload(mainStorage, prepared.existingFile, filename, mime);
 
-        // remember the last media type downloaded by the user
-        prefs.edit().putString(getString(R.string.last_used_download_type), selectedMediaType)
-                .apply();
+            // remember the last media type downloaded by the user
+            prefs.edit().putString(getString(R.string.last_used_download_type),
+                    selectedMediaType).apply();
+        });
     }
 
-    private void checkSelectedDownload(final StoredDirectoryHelper mainStorage,
-                                       final Uri targetFile,
+    private void askForNewDownloadFolder() {
+        Toast.makeText(context, getString(R.string.no_dir_yet),
+                Toast.LENGTH_LONG).show();
+
+        if (dialogBinding.videoAudioGroup.getCheckedRadioButtonId() == R.id.audio_button) {
+            launchDirectoryPicker(requestDownloadPickAudioFolderLauncher);
+        } else {
+            launchDirectoryPicker(requestDownloadPickVideoFolderLauncher);
+        }
+    }
+
+    private void checkSelectedDownload(@Nullable final StoredDirectoryHelper mainStorage,
+                                       @Nullable final Uri targetFile,
                                        final String filename,
                                        final String mime) {
-        StoredFileHelper storage;
+        runStorageTask(() -> resolveDownloadTarget(mainStorage, targetFile, filename, mime),
+                target -> onDownloadTargetResolved(mainStorage, targetFile, filename, mime,
+                        target));
+    }
 
-        try {
-            if (mainStorage == null) {
-                // using SAF on older android version
-                storage = new StoredFileHelper(context, null, targetFile, "");
-            } else if (targetFile == null) {
-                // the file does not exist, but it is probably used in a pending download
-                storage = new StoredFileHelper(mainStorage.getUri(), filename, mime,
-                        mainStorage.getTag());
-            } else {
-                // the target filename is already use, attempt to use it
-                storage = new StoredFileHelper(context, mainStorage.getUri(), targetFile,
-                        mainStorage.getTag());
-            }
-        } catch (final Exception e) {
-            ErrorUtil.createNotification(requireContext(),
-                    new ErrorInfo(e, UserAction.DOWNLOAD_FAILED, "Getting storage"));
-            return;
+    // Must run on a background thread, as it queries and possibly creates files.
+    @NonNull
+    private ResolvedTarget resolveDownloadTarget(@Nullable final StoredDirectoryHelper mainStorage,
+                                                 @Nullable final Uri targetFile,
+                                                 final String filename,
+                                                 final String mime) throws IOException {
+        final StoredFileHelper storage;
+        if (mainStorage == null) {
+            // using SAF on older android version
+            storage = new StoredFileHelper(context, null, targetFile, "");
+        } else if (targetFile == null) {
+            // the file does not exist, but it is probably used in a pending download
+            storage = new StoredFileHelper(mainStorage.getUri(), filename, mime,
+                    mainStorage.getTag());
+        } else {
+            // the target filename is already use, attempt to use it
+            storage = new StoredFileHelper(context, mainStorage.getUri(), targetFile,
+                    mainStorage.getTag());
         }
 
         // get state of potential mission referring to the same file
         final MissionState state = downloadManager.checkForExistingMission(storage);
+        if (state != MissionState.None) {
+            return new ResolvedTarget(state, storage, 0); // the user has to decide
+        }
+
+        // there is no mission referring to the same file
+        if (mainStorage == null) {
+            // This part is called if:
+            // * using SAF on older android version
+            // * save path not defined
+            // * if the file exists overwrite it, is not necessary ask
+            if (!storage.existsAsFile() && !storage.create()) {
+                return new ResolvedTarget(state, null, R.string.error_file_creation);
+            }
+            return new ResolvedTarget(state, storage, 0);
+        } else if (targetFile == null) {
+            // This part is called if:
+            // * the filename is not used in a pending/finished download
+            // * the file does not exist, create
+            if (!mainStorage.mkdirs()) {
+                return new ResolvedTarget(state, null, R.string.error_path_creation);
+            }
+
+            final StoredFileHelper created = mainStorage.createFile(filename, mime);
+            if (created == null || !created.canWrite()) {
+                return new ResolvedTarget(state, null, R.string.error_file_creation);
+            }
+            return new ResolvedTarget(state, created, 0);
+        }
+
+        // an unrelated file with the same name exists, the user has to decide
+        return new ResolvedTarget(state, storage, 0);
+    }
+
+    private void onDownloadTargetResolved(@Nullable final StoredDirectoryHelper mainStorage,
+                                          @Nullable final Uri targetFile,
+                                          final String filename,
+                                          final String mime,
+                                          @NonNull final ResolvedTarget target) {
+        if (target.errorMessage != 0) {
+            showFailedDialog(target.errorMessage);
+            return;
+        }
+
+        final MissionState state = target.state;
+        final StoredFileHelper finalStorage = target.storage;
         @StringRes final int msgBtn;
         @StringRes final int msgBody;
 
@@ -910,34 +992,9 @@ public class DownloadDialog extends DialogFragment
                 msgBody = R.string.download_already_running;
                 break;
             case None: // there is no mission referring to the same file
-                if (mainStorage == null) {
-                    // This part is called if:
-                    // * using SAF on older android version
-                    // * save path not defined
-                    // * if the file exists overwrite it, is not necessary ask
-                    if (!storage.existsAsFile() && !storage.create()) {
-                        showFailedDialog(R.string.error_file_creation);
-                        return;
-                    }
-                    continueSelectedDownload(storage);
-                    return;
-                } else if (targetFile == null) {
-                    // This part is called if:
-                    // * the filename is not used in a pending/finished download
-                    // * the file does not exist, create
-
-                    if (!mainStorage.mkdirs()) {
-                        showFailedDialog(R.string.error_path_creation);
-                        return;
-                    }
-
-                    storage = mainStorage.createFile(filename, mime);
-                    if (storage == null || !storage.canWrite()) {
-                        showFailedDialog(R.string.error_file_creation);
-                        return;
-                    }
-
-                    continueSelectedDownload(storage);
+                if (mainStorage == null || targetFile == null) {
+                    // the file is ready (see resolveDownloadTarget()), no need to ask
+                    continueSelectedDownload(finalStorage);
                     return;
                 }
                 msgBtn = R.string.overwrite;
@@ -951,8 +1008,6 @@ public class DownloadDialog extends DialogFragment
                 .setTitle(R.string.download_dialog_title)
                 .setMessage(msgBody)
                 .setNegativeButton(R.string.cancel, null);
-        final StoredFileHelper finalStorage = storage;
-
 
         if (mainStorage == null) {
             // This part is called if:
@@ -963,8 +1018,10 @@ public class DownloadDialog extends DialogFragment
                 case Finished:
                     askDialog.setPositiveButton(msgBtn, (dialog, which) -> {
                         dialog.dismiss();
-                        downloadManager.forgetMission(finalStorage);
-                        continueSelectedDownload(finalStorage);
+                        runStorageTask(() -> {
+                            downloadManager.forgetMission(finalStorage);
+                            return true;
+                        }, forgotten -> continueSelectedDownload(finalStorage));
                     });
                     break;
             }
@@ -975,64 +1032,82 @@ public class DownloadDialog extends DialogFragment
 
         askDialog.setPositiveButton(msgBtn, (dialog, which) -> {
             dialog.dismiss();
-
-            StoredFileHelper storageNew;
-            switch (state) {
-                case Finished:
-                case Pending:
-                    downloadManager.forgetMission(finalStorage);
-                case None:
-                    if (targetFile == null) {
-                        storageNew = mainStorage.createFile(filename, mime);
-                    } else {
-                        try {
-                            // try take (or steal) the file
-                            storageNew = new StoredFileHelper(context, mainStorage.getUri(),
-                                    targetFile, mainStorage.getTag());
-                        } catch (final IOException e) {
-                            Log.e(TAG, "Failed to take (or steal) the file in "
-                                    + targetFile.toString());
-                            storageNew = null;
+            runStorageTask(() -> Optional.ofNullable(replaceDownloadTarget(
+                    mainStorage, targetFile, filename, mime, state, finalStorage)),
+                    storageNew -> {
+                        if (storageNew.isPresent()) {
+                            continueSelectedDownload(storageNew.get());
+                        } else {
+                            showFailedDialog(R.string.error_file_creation);
                         }
-                    }
-
-                    if (storageNew != null && storageNew.canWrite()) {
-                        continueSelectedDownload(storageNew);
-                    } else {
-                        showFailedDialog(R.string.error_file_creation);
-                    }
-                    break;
-                case PendingRunning:
-                    storageNew = mainStorage.createUniqueFile(filename, mime);
-                    if (storageNew == null) {
-                        showFailedDialog(R.string.error_file_creation);
-                    } else {
-                        continueSelectedDownload(storageNew);
-                    }
-                    break;
-            }
+                    });
         });
 
         askDialog.show();
     }
 
+    // Must run on a background thread, as it deletes, queries and creates files.
+    // Returns the storage to download into, or null if it could not be created.
+    @Nullable
+    private StoredFileHelper replaceDownloadTarget(@NonNull final StoredDirectoryHelper mainStorage,
+                                                   @Nullable final Uri targetFile,
+                                                   final String filename,
+                                                   final String mime,
+                                                   final MissionState state,
+                                                   final StoredFileHelper oldStorage) {
+        StoredFileHelper storageNew;
+        switch (state) {
+            case Finished:
+            case Pending:
+                downloadManager.forgetMission(oldStorage);
+            case None:
+                if (targetFile == null) {
+                    storageNew = mainStorage.createFile(filename, mime);
+                } else {
+                    try {
+                        // try take (or steal) the file
+                        storageNew = new StoredFileHelper(context, mainStorage.getUri(),
+                                targetFile, mainStorage.getTag());
+                    } catch (final IOException e) {
+                        Log.e(TAG, "Failed to take (or steal) the file in "
+                                + targetFile.toString());
+                        storageNew = null;
+                    }
+                }
+                return storageNew != null && storageNew.canWrite() ? storageNew : null;
+            case PendingRunning:
+                return mainStorage.createUniqueFile(filename, mime);
+            default:
+                return null;
+        }
+    }
+
     private void continueSelectedDownload(@NonNull final StoredFileHelper storage) {
-        if (!storage.canWrite()) {
-            showFailedDialog(R.string.permission_denied);
-            return;
-        }
-
-        // check if the selected file has to be overwritten, by simply checking its length
-        try {
-            if (storage.length() > 0) {
-                storage.truncate();
+        runStorageTask(() -> {
+            if (!storage.canWrite()) {
+                return R.string.permission_denied;
             }
-        } catch (final IOException e) {
-            Log.e(TAG, "Failed to truncate the file: " + storage.getUri().toString(), e);
-            showFailedDialog(R.string.overwrite_failed);
-            return;
-        }
 
+            // check if the selected file has to be overwritten, by simply checking its length
+            try {
+                if (storage.length() > 0) {
+                    storage.truncate();
+                }
+            } catch (final IOException e) {
+                Log.e(TAG, "Failed to truncate the file: " + storage.getUri().toString(), e);
+                return R.string.overwrite_failed;
+            }
+            return 0;
+        }, errorMessage -> {
+            if (errorMessage != 0) {
+                showFailedDialog(errorMessage);
+            } else {
+                startSelectedDownload(storage);
+            }
+        });
+    }
+
+    private void startSelectedDownload(@NonNull final StoredFileHelper storage) {
         final Stream selectedStream;
         Stream secondaryStream = null;
         final char kind;
@@ -1123,5 +1198,93 @@ public class DownloadDialog extends DialogFragment
                 Toast.LENGTH_SHORT).show();
 
         dismiss();
+    }
+
+    /**
+     * Runs storage work (e.g. querying, creating or truncating files) on a background thread,
+     * and then passes its result to {@code onResult} on the main thread. The OK button is
+     * disabled in the meantime, to prevent starting the same download twice.
+     * <p>
+     * Storage providers (especially SAF) may take many seconds to answer, e.g. when the download
+     * folder contains many files or has just changed. Doing this on the main thread freezes the
+     * app and triggers "NewPipe isn't responding" dialogs.
+     *
+     * @param task     the storage work, run on a background thread
+     * @param onResult receives the result of {@code task} on the main thread, unless the dialog
+     *                 has been closed in the meantime
+     * @param <T>      the type of the result of {@code task}
+     */
+    private <T> void runStorageTask(@NonNull final Callable<T> task,
+                                    @NonNull final Consumer<T> onResult) {
+        setOkButtonEnabled(false);
+        disposables.add(Single.fromCallable(task)
+                .subscribeOn(Schedulers.io())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(result -> {
+                    setOkButtonEnabled(true);
+                    if (dialogBinding != null) { // the dialog may have been closed meanwhile
+                        onResult.accept(result);
+                    }
+                }, throwable -> {
+                    setOkButtonEnabled(true);
+                    ErrorUtil.createNotification(context, new ErrorInfo(throwable,
+                            UserAction.DOWNLOAD_FAILED, "Getting storage"));
+                }));
+    }
+
+    private void setOkButtonEnabled(final boolean enabled) {
+        if (okButton != null) {
+            okButton.setEnabled(enabled);
+        }
+    }
+
+    /**
+     * Result of the storage checks done in {@link #prepareSelectedDownload()}.
+     */
+    private static final class PreparedStorage {
+        static final PreparedStorage INVALID = new PreparedStorage(null);
+        static final PreparedStorage INSUFFICIENT_SPACE = new PreparedStorage(null);
+
+        @Nullable
+        final Uri existingFile;
+
+        PreparedStorage(@Nullable final Uri existingFile) {
+            this.existingFile = existingFile;
+        }
+    }
+
+    /**
+     * A newly picked download folder, and the file in it with the chosen name, if any.
+     */
+    private static final class ExistingFileCheck {
+        @NonNull
+        final StoredDirectoryHelper storage;
+        @Nullable
+        final Uri existingFile;
+
+        ExistingFileCheck(@NonNull final StoredDirectoryHelper storage,
+                          @Nullable final Uri existingFile) {
+            this.storage = storage;
+            this.existingFile = existingFile;
+        }
+    }
+
+    /**
+     * Result of {@link #resolveDownloadTarget}: the state of any existing mission for the file,
+     * the storage to use, or an error message to show.
+     */
+    private static final class ResolvedTarget {
+        final MissionState state;
+        @Nullable
+        final StoredFileHelper storage;
+        @StringRes
+        final int errorMessage;
+
+        ResolvedTarget(final MissionState state, @Nullable final StoredFileHelper storage,
+                       @StringRes final int errorMessage) {
+            this.state = state;
+            this.storage = storage;
+            this.errorMessage = errorMessage;
+        }
     }
 }
