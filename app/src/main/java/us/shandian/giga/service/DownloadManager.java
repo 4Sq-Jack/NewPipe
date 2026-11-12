@@ -118,7 +118,8 @@ public class DownloadManager {
         for (int i = finishedMissions.size() - 1; i >= 0; i--) {
             FinishedMission mission = finishedMissions.get(i);
 
-            if (!mission.storage.existsAsFile()) {
+            // the storage was just queried while loading, no need to query it again
+            if (!mission.storage.existsAsFileWhenCreated()) {
                 if (DEBUG) Log.d(TAG, "downloaded file removed: " + mission.storage.getName());
 
                 mFinishedMissionStore.deleteMission(mission);

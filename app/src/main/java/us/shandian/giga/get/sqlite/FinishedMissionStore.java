@@ -9,6 +9,7 @@ import android.net.Uri;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -149,7 +150,8 @@ public class FinishedMissionStore extends SQLiteOpenHelper {
         return values;
     }
 
-    private FinishedMission getMissionFromCursor(Cursor cursor) {
+    private FinishedMission getMissionFromCursor(Cursor cursor,
+                                                 @Nullable StoredFileHelper.PersistedTrees persistedTrees) {
         String kind = Objects.requireNonNull(cursor)
                 .getString(cursor.getColumnIndexOrThrow(KEY_KIND));
         if (kind == null || kind.isEmpty()) kind = "?";
@@ -164,7 +166,7 @@ public class FinishedMissionStore extends SQLiteOpenHelper {
         mission.kind = kind.charAt(0);
 
         try {
-            mission.storage = new StoredFileHelper(context,null, Uri.parse(path), "");
+            mission.storage = new StoredFileHelper(context, null, Uri.parse(path), "", persistedTrees);
         } catch (Exception e) {
             Log.e("FinishedMissionStore", "failed to load the storage path of: " + path, e);
             mission.storage = new StoredFileHelper(null, path, "", "");
@@ -186,9 +188,12 @@ public class FinishedMissionStore extends SQLiteOpenHelper {
         int count = cursor.getCount();
         if (count == 0) return new ArrayList<>(1);
 
+        // checked once for all downloads, see StoredFileHelper.PersistedTrees
+        final StoredFileHelper.PersistedTrees persistedTrees =
+                new StoredFileHelper.PersistedTrees(context);
         ArrayList<FinishedMission> result = new ArrayList<>(count);
         while (cursor.moveToNext()) {
-            result.add(getMissionFromCursor(cursor));
+            result.add(getMissionFromCursor(cursor, persistedTrees));
         }
 
         return result;

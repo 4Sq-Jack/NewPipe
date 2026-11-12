@@ -3,6 +3,8 @@ package org.schabi.newpipe.streams.io;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.UriPermission;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -26,6 +28,9 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 import us.shandian.giga.io.FileStream;
 import us.shandian.giga.io.FileStreamSAF;
@@ -41,6 +46,11 @@ public class StoredFileHelper implements Serializable {
     private transient DocumentFile docTree;
     private transient Path ioPath;
     private transient Context context;
+    /**
+     * Whether the SAF document existed as a file when it was queried by the constructor, see
+     * {@link #existsAsFileWhenCreated()}.
+     */
+    private transient boolean existedAsFileWhenCreated;
 
     protected String source;
     private String sourceTree;
@@ -120,9 +130,26 @@ public class StoredFileHelper implements Serializable {
 
     public StoredFileHelper(final Context context, @Nullable final Uri parent,
                             @NonNull final Uri path, final String tag) throws IOException {
+        this(context, parent, path, tag, null);
+    }
+
+    /**
+     * @param context        the context, used to access SAF documents
+     * @param parent         the folder containing the file, if known
+     * @param path           the file, either a {@code file://} or a SAF document URI
+     * @param tag            the storage tag, see {@link #getTag()}
+     * @param persistedTrees the folders the app already has persistent access to, used to avoid
+     *                       requesting persistent access to each file inside them; useful when
+     *                       creating many instances, e.g. when loading the download history
+     */
+    public StoredFileHelper(final Context context, @Nullable final Uri parent,
+                            @NonNull final Uri path, final String tag,
+                            @Nullable final PersistedTrees persistedTrees) throws IOException {
         this.tag = tag;
         this.source = path.toString();
 
+        String safName = null;
+        String safType = null;
         if (path.getScheme() == null
                 || path.getScheme().equalsIgnoreCase(ContentResolver.SCHEME_FILE)) {
             this.ioPath = Paths.get(URI.create(this.source));
@@ -135,13 +162,25 @@ public class StoredFileHelper implements Serializable {
 
             this.context = context;
 
-            if (file.getName() == null) {
+            // query the name and the type at once: each query is a round trip to the storage
+            // provider, which adds up when creating many instances
+            final String[] nameAndType = queryNameAndType(context, path);
+            if (nameAndType == null || nameAndType[0] == null) {
                 this.source = null;
                 return;
             } else {
                 this.docFile = file;
-                takePermissionSAF();
+                if (persistedTrees == null || !persistedTrees.contains(path)) {
+                    takePermissionSAF();
+                }
             }
+
+            safName = nameAndType[0];
+            // same as DocumentFile.getType(), DocumentFile.exists() and DocumentFile.isFile()
+            final String rawType = nameAndType[1];
+            final boolean isDirectory = DocumentsContract.Document.MIME_TYPE_DIR.equals(rawType);
+            safType = isDirectory ? null : rawType;
+            this.existedAsFileWhenCreated = !isDirectory && rawType != null && !rawType.isEmpty();
         }
 
         if (parent != null) {
@@ -152,8 +191,91 @@ public class StoredFileHelper implements Serializable {
             this.sourceTree = parent.toString();
         }
 
-        this.srcName = getName();
-        this.srcType = getType();
+        if (docFile == null) {
+            this.srcName = getName();
+            this.srcType = getType();
+        } else {
+            this.srcName = safName;
+            this.srcType = safType;
+        }
+    }
+
+    /**
+     * @param context the context, used to query the storage provider
+     * @param uri     the SAF document URI
+     * @return the display name and the MIME type of a SAF document (each may be {@code null}),
+     * or {@code null} if it does not exist or can't be accessed
+     */
+    @Nullable
+    private static String[] queryNameAndType(@NonNull final Context context,
+                                             @NonNull final Uri uri) {
+        final String[] projection = {DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE};
+        try (Cursor cursor = context.getContentResolver()
+                .query(uri, projection, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                return new String[]{cursor.isNull(0) ? null : cursor.getString(0),
+                        cursor.isNull(1) ? null : cursor.getString(1)};
+            }
+        } catch (final Exception e) {
+            Log.w(TAG, "Failed to query " + uri, e);
+        }
+        return null;
+    }
+
+    /**
+     * Like {@link #existsAsFile()}, but SAF documents are not queried again: the result of the
+     * query made when this instance was created is used instead. This avoids a round trip to the
+     * storage provider, which adds up when checking many files, e.g. the download history.
+     *
+     * @return whether the file existed when this instance was created
+     */
+    public boolean existsAsFileWhenCreated() {
+        if (source == null || docFile == null) {
+            return existsAsFile(); // invalid or non-SAF, the latter is cheap to check
+        }
+        return existedAsFileWhenCreated;
+    }
+
+    /**
+     * A snapshot of the SAF folders (trees) the app has persistent read and write access to.
+     * Persistent access to a folder covers all files inside it, so there is no need to request
+     * it for each of them.
+     */
+    public static final class PersistedTrees {
+        private final Set<Uri> trees = new HashSet<>();
+
+        public PersistedTrees(@NonNull final Context context) {
+            final List<UriPermission> permissions =
+                    context.getContentResolver().getPersistedUriPermissions();
+            for (final UriPermission permission : permissions) {
+                if (permission.isReadPermission() && permission.isWritePermission()) {
+                    trees.add(permission.getUri());
+                }
+            }
+        }
+
+        /**
+         * @param documentUri a SAF document URI
+         * @return whether the document was obtained through one of the persisted folders, i.e.
+         * {@code content://authority/tree/<folder>/document/<file>} with a persisted
+         * {@code content://authority/tree/<folder>}; documents picked on their own (e.g. with
+         * "Save as") are never contained
+         */
+        public boolean contains(@NonNull final Uri documentUri) {
+            final List<String> segments = documentUri.getPathSegments();
+            // DocumentsContract.isTreeUri() requires API 24
+            if (segments.size() < 4 || !"tree".equals(segments.get(0))) {
+                return false;
+            }
+            try {
+                return trees.contains(DocumentsContract.buildTreeDocumentUri(
+                        documentUri.getAuthority(),
+                        DocumentsContract.getTreeDocumentId(documentUri)));
+            } catch (final IllegalArgumentException e) {
+                return false;
+            }
+        }
     }
 
 
